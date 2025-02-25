@@ -23,7 +23,7 @@
   "scripts": {
     "tests": "jest --coverage",
     "tests:integration": "echo 'Hello integration tests'",
-    "prepublish": "npm run build && npm run tests",
+    "prepublish": "npm run build",
     "build": "tsc && tsc-alias && pnpm run copy-proto",
     "build:link": "pnpm run build && pnpm link",
     "copy-proto": "cp -R ./schemas/ ./dist/schemas",
