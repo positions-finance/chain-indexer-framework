@@ -1,0 +1,23 @@
+package globalexitrootpackage;
+syntax = "proto3";
+
+message ExitRoots {
+    string mainnet = 1;
+    string rollUp = 2;
+}
+
+message GlobalExitRoot {
+    message GlobalExitRootEvent {
+        uint64 rollUpId = 1;
+        uint64 batchNumber = 2;
+        uint64 depositCount = 3;
+        string aggregator = 4;
+        string rollUpExitRoot = 5;
+        string globalExitRoot = 6;
+        ExitRoots exitRoots = 7;
+    }
+
+    uint64 blockNumber = 1;
+    uint64 timestamp = 2;
+    repeated GlobalExitRootEvent data = 3;
+}

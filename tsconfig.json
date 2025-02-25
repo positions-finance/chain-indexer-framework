@@ -1,0 +1,26 @@
+{
+    "compilerOptions": {
+        "module": "NodeNext",
+        "allowSyntheticDefaultImports": true,
+        "moduleResolution": "nodenext",
+        "resolveJsonModule": true,
+        "esModuleInterop": true,
+        "target": "esnext",
+        "sourceMap": true,
+        "outDir": "dist/",
+        "declaration": true,
+        "strict": true,
+        "types": ["node"],
+        "alwaysStrict": true,
+        "baseUrl": "./",
+        "paths": {
+            "@internal/*": [
+                "internal/*"
+            ]
+        },
+    },
+    "include": [
+        "./internal/**/*",
+        "./public/**/*"
+    ]
+}
