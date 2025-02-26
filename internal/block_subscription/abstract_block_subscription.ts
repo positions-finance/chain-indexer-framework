@@ -80,30 +80,30 @@ export abstract class AbstractBlockSubscription extends Queue<IBlockGetterWorker
 
             this.checkIfLive(this.lastBlockHash);
 
-            this.subscription = this.eth.subscribe("logs", { fromBlock: this.nextBlock })
-                .on("data", (log: Log) => {
+            this.subscription = this.eth.subscribe("newHeads")
+                .on("data", (blockHeader: any) => {
                     try {
                         Logger.debug({
                             location: "eth_subscribe",
-                            blockHash: log.blockHash,
-                            blockNumber: log.blockNumber,
-                            logIndex: log.logIndex
+                            blockHash: blockHeader.hash,
+                            blockNumber: blockHeader.number,
                         });
 
-                        if (this.lastBlockHash == log.blockHash) {
-
+                        if (this.lastBlockHash === blockHeader.hash) {
                             return;
                         }
 
+                        const blockNumber = parseInt(blockHeader.number);
+                        
                         //Adding below logic to get empty blocks details which have not been added to queue.
-                        if (this.hasMissedBlocks(log.blockNumber)) {
-                            this.enqueueMissedBlocks(log.blockNumber);
+                        if (this.hasMissedBlocks(blockNumber)) {
+                            this.enqueueMissedBlocks(blockNumber);
                         }
 
-                        this.lastBlockHash = log.blockHash;
-                        this.lastReceivedBlockNumber = log.blockNumber;
+                        this.lastBlockHash = blockHeader.hash;
+                        this.lastReceivedBlockNumber = blockNumber;
 
-                        this.enqueue(this.getBlockFromWorker(log.blockNumber));
+                        this.enqueue(this.getBlockFromWorker(blockNumber));
 
                         if (!this.processingQueue) {
                             this.processQueue();
