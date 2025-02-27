@@ -24,7 +24,7 @@ export abstract class AbstractBlockSubscription
   extends Queue<IBlockGetterWorkerPromise>
   implements IBlockSubscription<IBlock, BlockProducerError>
 {
-  private subscription: Subscription<Log | BlockHeader> | null = null;
+  private subscription: Subscription<BlockHeader> | null = null;
   // @ts-ignore
   protected observer: IObserver<IBlock, BlockProducerError>; // ts-ignore added for this special case (it will always get initialized in the subscribe method).
   private lastBlockHash: string = "";
@@ -95,10 +95,12 @@ export abstract class AbstractBlockSubscription
         .subscribe("newBlockHeaders")
         .on("data", (blockHeader: BlockHeader) => {
           try {
+            // Only log once per block for debugging
             Logger.debug({
-              location: "eth_subscribe",
+              location: "eth_subscribe_newheads",  // Changed to clearly identify we're using newBlockHeaders
               blockHash: blockHeader.hash,
-              blockNumber: blockHeader.number,
+              blockNumber: blockHeader.number
+              // Removed logIndex since we're getting block headers, not logs
             });
 
             if (this.lastBlockHash === blockHeader.hash) {
@@ -151,7 +153,7 @@ export abstract class AbstractBlockSubscription
         return;
       }
 
-      (this.subscription as Subscription<Log>).unsubscribe(
+      this.subscription.unsubscribe(
         (error: Error, success: boolean) => {
           if (success) {
             this.subscription = null;
