@@ -91,15 +91,16 @@ export abstract class AbstractBlockSubscription
 
       this.checkIfLive(this.lastBlockHash);
 
-      this.subscription = this.eth
-        .subscribe("newBlockHeaders")
+      // Subscribe to new block headers
+      this.subscription = (this.eth as any)
+        .subscribe("newHeads")
         .on("data", (blockHeader: BlockHeader) => {
           try {
             // Only log once per block for debugging
             Logger.debug({
-              location: "eth_subscribe_newheads",  // Changed to clearly identify we're using newBlockHeaders
+              location: "eth_subscribe_newheads", // Changed to clearly identify we're using newBlockHeaders
               blockHash: blockHeader.hash,
-              blockNumber: blockHeader.number
+              blockNumber: blockHeader.number,
               // Removed logIndex since we're getting block headers, not logs
             });
 
@@ -126,7 +127,7 @@ export abstract class AbstractBlockSubscription
             observer.error(BlockProducerError.createUnknown(error));
           }
         })
-        .on("error", (error) => {
+        .on("error", (error: any) => {
           observer.error(BlockProducerError.createUnknown(error));
         });
     } catch (error) {
@@ -153,18 +154,16 @@ export abstract class AbstractBlockSubscription
         return;
       }
 
-      this.subscription.unsubscribe(
-        (error: Error, success: boolean) => {
-          if (success) {
-            this.subscription = null;
-            resolve(true);
+      this.subscription.unsubscribe((error: Error, success: boolean) => {
+        if (success) {
+          this.subscription = null;
+          resolve(true);
 
-            return;
-          }
-
-          reject(BlockProducerError.createUnknown(error));
+          return;
         }
-      );
+
+        reject(BlockProducerError.createUnknown(error));
+      });
     });
   }
 
