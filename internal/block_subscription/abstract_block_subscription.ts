@@ -40,6 +40,7 @@ export abstract class AbstractBlockSubscription
     hash: string;
   };
   private lastReconnectTime: number = 0;
+  private chainId: number = 0;
 
   /**
    * @constructor
@@ -70,6 +71,14 @@ export abstract class AbstractBlockSubscription
     observer: IObserver<IBlock, BlockProducerError>,
     startBlock: number
   ): Promise<void> {
+    if (this.subscription) {
+      Logger.warn({
+        location: "eth_subscribe",
+        message: "Already subscribed, skipping",
+      });
+      return;
+    }
+
     try {
       this.lastFinalizedBlock =
         this.blockDelay > 0
@@ -81,9 +90,42 @@ export abstract class AbstractBlockSubscription
       this.fatalError = false;
       this.nextBlock = startBlock;
       this.lastBlockHash = "";
-      this.lastReceivedBlockNumber = startBlock - 1;
 
-      // Number 50 is added to allow block producer to create log subscription even and catch up after backfilling.
+      // Validate chain ID to ensure we're on the correct network
+      const chainId = await this.eth.getChainId();
+      this.chainId = chainId;
+      Logger.info({
+        location: "eth_subscribe",
+        message: "Connected to chain",
+        chainId
+      });
+
+      // Initialize lastReceivedBlockNumber to startBlock - 1 if not set
+      if (this.lastReceivedBlockNumber === 0) {
+        this.lastReceivedBlockNumber = startBlock - 1;
+        Logger.info({
+          location: "eth_subscribe_init",
+          message: "Initializing lastReceivedBlockNumber",
+          value: this.lastReceivedBlockNumber
+        });
+      }
+
+      // Check for potentially invalid lastReceivedBlockNumber (e.g., from a different chain)
+      // This handles cases where the stored lastReceivedBlockNumber is unreasonably high
+      const latestBlock = await this.eth.getBlock("latest");
+      if (latestBlock && this.lastReceivedBlockNumber > 0 && 
+          this.lastReceivedBlockNumber > latestBlock.number + 1000000) {
+        Logger.warn({
+          location: "eth_subscribe_reset",
+          message: "Detected invalid lastReceivedBlockNumber - resetting to latest block",
+          oldValue: this.lastReceivedBlockNumber,
+          latestBlockNumber: latestBlock.number,
+          newValue: startBlock - 1
+        });
+        this.lastReceivedBlockNumber = startBlock - 1;
+      }
+
+      // Backfill historical blocks
       if (this.lastFinalizedBlock - 50 > startBlock) {
         this.backFillBlocks();
 
@@ -101,6 +143,39 @@ export abstract class AbstractBlockSubscription
             const blockNumber = typeof blockHeader.number === 'string' ? 
               parseInt(blockHeader.number) : blockHeader.number;
             const blockHash = blockHeader.hash;
+
+            // Log more details for debugging
+            Logger.debug({
+              location: "eth_subscribe_received",
+              blockHash,
+              blockNumber,
+              lastBlockHash: this.lastBlockHash,
+              lastBlockNumber: this.lastReceivedBlockNumber
+            });
+
+            // Check for potential chain mismatch (if block numbers are drastically different)
+            if (this.lastReceivedBlockNumber > 0 && 
+                Math.abs(blockNumber - this.lastReceivedBlockNumber) > 1000000) {
+              Logger.warn({
+                location: "eth_subscribe_chain_mismatch",
+                message: "Detected potential chain mismatch - block numbers too far apart",
+                receivedBlockNumber: blockNumber,
+                lastBlockNumber: this.lastReceivedBlockNumber,
+                chainId: this.chainId
+              });
+              
+              // Reset the lastReceivedBlockNumber if it seems to be from a different chain
+              // This is a safety measure to prevent permanently skipping blocks
+              if (blockNumber < this.lastReceivedBlockNumber) {
+                Logger.warn({
+                  location: "eth_subscribe_reset",
+                  message: "Resetting lastReceivedBlockNumber due to potential chain mismatch",
+                  oldValue: this.lastReceivedBlockNumber,
+                  newValue: blockNumber - 1
+                });
+                this.lastReceivedBlockNumber = blockNumber - 1;
+              }
+            }
 
             // Skip if we've already seen this block hash or if block number is not newer
             if (blockHash === this.lastBlockHash || blockNumber <= this.lastReceivedBlockNumber) {
@@ -323,6 +398,14 @@ export abstract class AbstractBlockSubscription
           // first check if we can get the latest block to verify the connection
           try {
             const latestBlock = await this.eth.getBlock("latest");
+            
+            // Log detailed information about the latest block
+            Logger.debug({
+              location: "eth_subscribe_latest_block",
+              blockHash: latestBlock?.hash,
+              blockNumber: latestBlock?.number,
+              lastReceivedBlockNumber: this.lastReceivedBlockNumber
+            });
             
             if (latestBlock && latestBlock.hash !== this.lastBlockHash) {
               // Connection is working but subscription isn't delivering blocks
