@@ -7,7 +7,6 @@ import { IBlock } from "../interfaces/block.js";
 import { Logger } from "../logger/logger.js";
 import { Queue } from "../queue/queue.js";
 import { Eth } from "web3-eth";
-import { Log } from "web3-core";
 import { BlockHeader } from "web3-eth";
 import Long from "long";
 
@@ -47,13 +46,16 @@ export abstract class AbstractBlockSubscription
    *
    * @param {Eth} eth - Eth module from web3.js
    * @param {number} timeout - Timeout for which if there has been no event, connection must be restarted.
+   * @param {number} reconnectCooldown - Cooldown period between forced reconnections.
    */
   constructor(
     private eth: Eth,
     private timeout: number = 60000,
-    private blockDelay: number = 0
+    private blockDelay: number = 0,
+    private reconnectCooldown: number = 300000 // 5 minutes cooldown between forced reconnections
   ) {
     super();
+    this.lastReceivedBlockNumber = 0; // Ensure it starts at 0 to be properly initialized
   }
 
   /**
@@ -97,33 +99,19 @@ export abstract class AbstractBlockSubscription
       Logger.info({
         location: "eth_subscribe",
         message: "Connected to chain",
-        chainId
+        chainId,
       });
 
-      // Initialize lastReceivedBlockNumber to startBlock - 1 if not set
-      if (this.lastReceivedBlockNumber === 0) {
-        this.lastReceivedBlockNumber = startBlock - 1;
-        Logger.info({
-          location: "eth_subscribe_init",
-          message: "Initializing lastReceivedBlockNumber",
-          value: this.lastReceivedBlockNumber
-        });
-      }
+      // Initialize lastReceivedBlockNumber to startBlock - 1
+      // Always reset to ensure we don't have an invalid value from a previous run
+      this.lastReceivedBlockNumber = startBlock - 1;
+      Logger.info({
+        location: "eth_subscribe_init",
+        message: "Initializing lastReceivedBlockNumber",
+        value: this.lastReceivedBlockNumber,
+      });
 
-      // Check for potentially invalid lastReceivedBlockNumber (e.g., from a different chain)
-      // This handles cases where the stored lastReceivedBlockNumber is unreasonably high
-      const latestBlock = await this.eth.getBlock("latest");
-      if (latestBlock && this.lastReceivedBlockNumber > 0 && 
-          this.lastReceivedBlockNumber > latestBlock.number + 1000000) {
-        Logger.warn({
-          location: "eth_subscribe_reset",
-          message: "Detected invalid lastReceivedBlockNumber - resetting to latest block",
-          oldValue: this.lastReceivedBlockNumber,
-          latestBlockNumber: latestBlock.number,
-          newValue: startBlock - 1
-        });
-        this.lastReceivedBlockNumber = startBlock - 1;
-      }
+      // Skip the check for potentially invalid lastReceivedBlockNumber since we're always resetting it now
 
       // Backfill historical blocks
       if (this.lastFinalizedBlock - 50 > startBlock) {
@@ -140,52 +128,27 @@ export abstract class AbstractBlockSubscription
         .on("data", (blockHeader: BlockHeader) => {
           try {
             // Convert block number to number type if it's a string
-            const blockNumber = typeof blockHeader.number === 'string' ? 
-              parseInt(blockHeader.number) : blockHeader.number;
+            const blockNumber =
+              typeof blockHeader.number === "string"
+                ? parseInt(blockHeader.number)
+                : blockHeader.number;
             const blockHash = blockHeader.hash;
 
-            // Log more details for debugging
-            Logger.debug({
-              location: "eth_subscribe_received",
-              blockHash,
-              blockNumber,
-              lastBlockHash: this.lastBlockHash,
-              lastBlockNumber: this.lastReceivedBlockNumber
-            });
-
-            // Check for potential chain mismatch (if block numbers are drastically different)
-            if (this.lastReceivedBlockNumber > 0 && 
-                Math.abs(blockNumber - this.lastReceivedBlockNumber) > 1000000) {
-              Logger.warn({
-                location: "eth_subscribe_chain_mismatch",
-                message: "Detected potential chain mismatch - block numbers too far apart",
-                receivedBlockNumber: blockNumber,
-                lastBlockNumber: this.lastReceivedBlockNumber,
-                chainId: this.chainId
-              });
-              
-              // Reset the lastReceivedBlockNumber if it seems to be from a different chain
-              // This is a safety measure to prevent permanently skipping blocks
-              if (blockNumber < this.lastReceivedBlockNumber) {
-                Logger.warn({
-                  location: "eth_subscribe_reset",
-                  message: "Resetting lastReceivedBlockNumber due to potential chain mismatch",
-                  oldValue: this.lastReceivedBlockNumber,
-                  newValue: blockNumber - 1
-                });
-                this.lastReceivedBlockNumber = blockNumber - 1;
-              }
-            }
-
             // Skip if we've already seen this block hash or if block number is not newer
-            if (blockHash === this.lastBlockHash || blockNumber <= this.lastReceivedBlockNumber) {
+            if (
+              blockHash === this.lastBlockHash ||
+              blockNumber <= this.lastReceivedBlockNumber
+            ) {
               Logger.debug({
                 location: "eth_subscribe_skip",
-                reason: blockHash === this.lastBlockHash ? "duplicate_hash" : "old_block",
+                reason:
+                  blockHash === this.lastBlockHash
+                    ? "duplicate_hash"
+                    : "old_block",
                 blockHash,
                 blockNumber,
                 lastBlockHash: this.lastBlockHash,
-                lastBlockNumber: this.lastReceivedBlockNumber
+                lastBlockNumber: this.lastReceivedBlockNumber,
               });
               return;
             }
@@ -378,7 +341,9 @@ export abstract class AbstractBlockSubscription
       i < currentBlockNumber - this.lastReceivedBlockNumber;
       i++
     ) {
-      this.enqueue(this.getBlockFromWorker(this.lastReceivedBlockNumber + i, undefined));
+      this.enqueue(
+        this.getBlockFromWorker(this.lastReceivedBlockNumber + i, undefined)
+      );
     }
   }
 
@@ -389,89 +354,115 @@ export abstract class AbstractBlockSubscription
         try {
           Logger.debug({
             location: "eth_subscribe_reconnect",
-            message: "No new blocks received in timeout period, checking connection",
+            message:
+              "No new blocks received in timeout period, checking connection",
             lastBlockHash,
-            timeout: this.timeout
+            timeout: this.timeout,
           });
-          
+
           // Instead of immediately unsubscribing and resubscribing,
           // first check if we can get the latest block to verify the connection
           try {
             const latestBlock = await this.eth.getBlock("latest");
-            
+
             // Log detailed information about the latest block
             Logger.debug({
               location: "eth_subscribe_latest_block",
               blockHash: latestBlock?.hash,
               blockNumber: latestBlock?.number,
-              lastReceivedBlockNumber: this.lastReceivedBlockNumber
+              lastReceivedBlockNumber: this.lastReceivedBlockNumber,
             });
-            
+
             if (latestBlock && latestBlock.hash !== this.lastBlockHash) {
               // Connection is working but subscription isn't delivering blocks
               // Process this block manually and reset the timeout
               Logger.debug({
                 location: "eth_subscribe_manual_block",
-                message: "Connection is working but subscription isn't delivering blocks",
+                message:
+                  "Connection is working but subscription isn't delivering blocks",
                 blockHash: latestBlock.hash,
-                blockNumber: latestBlock.number
+                blockNumber: latestBlock.number,
               });
-              
-              const blockNumber = typeof latestBlock.number === 'string' ? 
-                parseInt(latestBlock.number) : latestBlock.number;
-              
+
+              const blockNumber =
+                typeof latestBlock.number === "string"
+                  ? parseInt(latestBlock.number)
+                  : latestBlock.number;
+
               // Only process if it's a new block
               if (blockNumber > this.lastReceivedBlockNumber) {
                 this.lastBlockHash = latestBlock.hash;
                 this.lastReceivedBlockNumber = blockNumber;
-                
+
                 if (this.hasMissedBlocks(blockNumber)) {
                   this.enqueueMissedBlocks(blockNumber);
                 }
-                
+
                 this.enqueue(this.getBlockFromWorker(blockNumber, undefined));
                 if (!this.processingQueue) {
                   this.processQueue();
                 }
-                
+
                 // Reset the check with the new hash
                 this.checkIfLive(latestBlock.hash);
                 return;
               }
             }
-            
+
             // If we get here, either:
             // 1. We couldn't get the latest block (connection issue)
             // 2. The latest block is the same as our last block (chain isn't progressing)
             // 3. We already processed the latest block manually
-            
-            // Only reconnect if it's been a long time (3x the timeout)
-            // This prevents excessive reconnections
-            if (Date.now() - this.lastReconnectTime > this.timeout * 3) {
+
+            // Only reconnect if it's been a long time since the last reconnection
+            // This prevents excessive reconnections and eth_subscribe calls
+            if (Date.now() - this.lastReconnectTime > this.reconnectCooldown) {
               Logger.debug({
                 location: "eth_subscribe_force_reconnect",
-                message: "Forcing reconnection after extended period without new blocks"
+                message:
+                  "Forcing reconnection after extended period without new blocks",
+                timeSinceLastReconnect: Date.now() - this.lastReconnectTime,
+                reconnectCooldown: this.reconnectCooldown,
               });
-              
+
               await this.unsubscribe();
               await this.subscribe(this.observer, this.nextBlock);
               this.lastReconnectTime = Date.now();
             } else {
-              // Just check again later
+              // Just check again later without reconnecting
+              Logger.debug({
+                location: "eth_subscribe_skip_reconnect",
+                message: "Skipping reconnection due to cooldown period",
+                timeSinceLastReconnect: Date.now() - this.lastReconnectTime,
+                reconnectCooldown: this.reconnectCooldown,
+              });
               this.checkIfLive(this.lastBlockHash);
             }
           } catch (error) {
             // If we can't even get the latest block, there's likely a connection issue
-            // So we should reconnect
-            Logger.debug({
-              location: "eth_subscribe_connection_error",
-              message: "Error getting latest block, reconnecting",
-              error: String(error)
-            });
-            
-            await this.unsubscribe();
-            await this.subscribe(this.observer, this.nextBlock);
-            this.lastReconnectTime = Date.now();
+            // But still respect the reconnection cooldown
+            if (Date.now() - this.lastReconnectTime > this.reconnectCooldown) {
+              Logger.debug({
+                location: "eth_subscribe_connection_error",
+                message: "Error getting latest block, reconnecting",
+                error: String(error),
+              });
+
+              await this.unsubscribe();
+              await this.subscribe(this.observer, this.nextBlock);
+              this.lastReconnectTime = Date.now();
+            } else {
+              // Just check again later without reconnecting
+              Logger.debug({
+                location: "eth_subscribe_skip_reconnect_error",
+                message:
+                  "Error getting latest block, but skipping reconnection due to cooldown period",
+                error: String(error),
+                timeSinceLastReconnect: Date.now() - this.lastReconnectTime,
+                reconnectCooldown: this.reconnectCooldown,
+              });
+              this.checkIfLive(this.lastBlockHash);
+            }
           }
         } catch (error) {
           this.observer.error(
