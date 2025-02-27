@@ -85,7 +85,7 @@ export abstract class AbstractBlockSubscription
       // Number 50 is added to allow block producer to create log subscription even and catch up after backfilling.
       if (this.lastFinalizedBlock - 50 > startBlock) {
         this.backFillBlocks();
-
+        
         return;
       }
 
@@ -95,22 +95,23 @@ export abstract class AbstractBlockSubscription
       this.subscription = (this.eth as any)
         .subscribe("newHeads")
         .on("data", (blockHeader: BlockHeader) => {
+          console.log("TEST SCRIPT");
           try {
-            // Only log once per block for debugging
-            Logger.debug({
-              location: "eth_subscribe_newheads", // Changed to clearly identify we're using newBlockHeaders
-              blockHash: blockHeader.hash,
-              blockNumber: blockHeader.number,
-              // Removed logIndex since we're getting block headers, not logs
-            });
-
+            // Skip processing if we've already processed this block
             if (this.lastBlockHash === blockHeader.hash) {
               return;
             }
 
+            // Log only once per block
+            Logger.debug({
+              location: "eth_subscribe_newheads",
+              blockHash: blockHeader.hash,
+              blockNumber: blockHeader.number,
+            });
+
             const blockNumber = blockHeader.number;
 
-            //Adding below logic to get empty blocks details which have not been added to queue.
+            // Check for missed blocks
             if (this.hasMissedBlocks(blockNumber)) {
               this.enqueueMissedBlocks(blockNumber);
             }
@@ -150,7 +151,6 @@ export abstract class AbstractBlockSubscription
 
       if (!this.subscription) {
         resolve(true);
-
         return;
       }
 
@@ -158,7 +158,6 @@ export abstract class AbstractBlockSubscription
         if (success) {
           this.subscription = null;
           resolve(true);
-
           return;
         }
 
@@ -231,7 +230,6 @@ export abstract class AbstractBlockSubscription
         }
         this.fatalError = true;
         this.observer.error(BlockProducerError.createUnknown(error));
-
         break;
       }
     }
@@ -289,13 +287,21 @@ export abstract class AbstractBlockSubscription
     }
   }
 
+  /**
+   * @private
+   *
+   * Method to check if subscription is still receiving events and restart if necessary.
+   *
+   * @param {string} lastBlockHash - Hash of the last block received when timeout was set.
+   *
+   * @returns {void}
+   */
   private checkIfLive(lastBlockHash: string): void {
     this.checkIfLiveTimeout = setTimeout(async () => {
       //Check if the block hash has changed since the timeout.
       if (this.lastBlockHash === lastBlockHash) {
         try {
           await this.unsubscribe();
-
           await this.subscribe(this.observer, this.nextBlock);
         } catch (error) {
           this.observer.error(
@@ -304,7 +310,6 @@ export abstract class AbstractBlockSubscription
             )
           );
         }
-
         return;
       }
 
