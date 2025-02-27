@@ -1,5 +1,5 @@
 export interface IBlockHeader {
-    number: number;
+    number: string;
     hash: string;
     gasLimit: number;
     gasUsed: number;

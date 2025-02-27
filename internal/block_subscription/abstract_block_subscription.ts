@@ -8,297 +8,306 @@ import { Logger } from "../logger/logger.js";
 import { Queue } from "../queue/queue.js";
 import { Eth } from "web3-eth";
 import { Log } from "web3-core";
+import { BlockHeader } from "web3-eth";
 import Long from "long";
 
 /**
  * @abstract
- * 
- * Block subscription class which emits full block data whenever added to chain and 
- * takes care to backfill historical blocks requested. The backfilling strategy needs to be implemented by 
+ *
+ * Block subscription class which emits full block data whenever added to chain and
+ * takes care to backfill historical blocks requested. The backfilling strategy needs to be implemented by
  * class extending from this.
- * 
+ *
  * @author - Vibhu Rajeev
  */
-export abstract class AbstractBlockSubscription extends Queue<IBlockGetterWorkerPromise> implements IBlockSubscription<IBlock, BlockProducerError> {
-    private subscription: Subscription<Log> | null = null;
-    // @ts-ignore 
-    protected observer: IObserver<IBlock, BlockProducerError>; // ts-ignore added for this special case (it will always get initialized in the subscribe method).
-    private lastBlockHash: string = "";
-    private processingQueue: boolean = false;
-    protected fatalError: boolean = false;
-    protected lastFinalizedBlock: number = 0;
-    protected nextBlock: number = 0;
-    protected activeBackFillingId: number | null = null;
-    private checkIfLiveTimeout?: NodeJS.Timeout;
-    private lastReceivedBlockNumber: number = 0;
-    private lastEmittedBlock?: {
-        number: number,
-        hash: string
-    };
+export abstract class AbstractBlockSubscription
+  extends Queue<IBlockGetterWorkerPromise>
+  implements IBlockSubscription<IBlock, BlockProducerError>
+{
+  private subscription: Subscription<Log | BlockHeader> | null = null;
+  // @ts-ignore
+  protected observer: IObserver<IBlock, BlockProducerError>; // ts-ignore added for this special case (it will always get initialized in the subscribe method).
+  private lastBlockHash: string = "";
+  private processingQueue: boolean = false;
+  protected fatalError: boolean = false;
+  protected lastFinalizedBlock: number = 0;
+  protected nextBlock: number = 0;
+  protected activeBackFillingId: number | null = null;
+  private checkIfLiveTimeout?: NodeJS.Timeout;
+  private lastReceivedBlockNumber: number = 0;
+  private lastEmittedBlock?: {
+    number: number;
+    hash: string;
+  };
 
-    /**
-     * @constructor
-     * 
-     * @param {Eth} eth - Eth module from web3.js
-     * @param {number} timeout - Timeout for which if there has been no event, connection must be restarted. 
-     */
-    constructor(private eth: Eth, private timeout: number = 60000, private blockDelay: number = 0) {
-        super();
-    }
+  /**
+   * @constructor
+   *
+   * @param {Eth} eth - Eth module from web3.js
+   * @param {number} timeout - Timeout for which if there has been no event, connection must be restarted.
+   */
+  constructor(
+    private eth: Eth,
+    private timeout: number = 60000,
+    private blockDelay: number = 0
+  ) {
+    super();
+  }
 
-    /**
-     * The subscribe method starts the subscription from last produced block, and calls observer.next for 
-     * each new block.
-     *
-     * @param {IObserver} observer - The observer object with its functions which will be called on events.
-     * @param {number} startBlock - The block number to start subscribing from.
-     * 
-     * @returns {Promise<void>} 
-     * 
-     * @throws {BlockProducerError} - On failure to get start block or start subscription.
-     */
-    public async subscribe(observer: IObserver<IBlock, BlockProducerError>, startBlock: number): Promise<void> {
-        try {
+  /**
+   * The subscribe method starts the subscription from last produced block, and calls observer.next for
+   * each new block.
+   *
+   * @param {IObserver} observer - The observer object with its functions which will be called on events.
+   * @param {number} startBlock - The block number to start subscribing from.
+   *
+   * @returns {Promise<void>}
+   *
+   * @throws {BlockProducerError} - On failure to get start block or start subscription.
+   */
+  public async subscribe(
+    observer: IObserver<IBlock, BlockProducerError>,
+    startBlock: number
+  ): Promise<void> {
+    try {
+      this.lastFinalizedBlock =
+        this.blockDelay > 0
+          ? (await this.eth.getBlock("latest")).number - this.blockDelay
+          : (await this.eth.getBlock("finalized")).number;
+      // Clear any previously existing queue
+      this.clear();
+      this.observer = observer;
+      this.fatalError = false;
+      this.nextBlock = startBlock;
+      this.lastBlockHash = "";
+      this.lastReceivedBlockNumber = startBlock - 1;
 
-            this.lastFinalizedBlock = this.blockDelay > 0
-                                        ? (await this.eth.getBlock("latest")).number - this.blockDelay 
-                                        : (await this.eth.getBlock("finalized")).number;
-            // Clear any previously existing queue
-            this.clear();
-            this.observer = observer;
-            this.fatalError = false;
-            this.nextBlock = startBlock;
-            this.lastBlockHash = "";
-            this.lastReceivedBlockNumber = startBlock - 1;
+      // Number 50 is added to allow block producer to create log subscription even and catch up after backfilling.
+      if (this.lastFinalizedBlock - 50 > startBlock) {
+        this.backFillBlocks();
 
-            // Number 50 is added to allow block producer to create log subscription even and catch up after backfilling. 
-            if (this.lastFinalizedBlock - 50 > startBlock) {
-                this.backFillBlocks();
+        return;
+      }
 
-                return;
-            }
+      this.checkIfLive(this.lastBlockHash);
 
-            this.checkIfLive(this.lastBlockHash);
-
-            this.subscription = this.eth.subscribe("newHeads")
-                .on("data", (blockHeader: any) => {
-                    try {
-                        Logger.debug({
-                            location: "eth_subscribe",
-                            blockHash: blockHeader.hash,
-                            blockNumber: blockHeader.number,
-                        });
-
-                        if (this.lastBlockHash === blockHeader.hash) {
-                            return;
-                        }
-
-                        const blockNumber = parseInt(blockHeader.number);
-                        
-                        //Adding below logic to get empty blocks details which have not been added to queue.
-                        if (this.hasMissedBlocks(blockNumber)) {
-                            this.enqueueMissedBlocks(blockNumber);
-                        }
-
-                        this.lastBlockHash = blockHeader.hash;
-                        this.lastReceivedBlockNumber = blockNumber;
-
-                        this.enqueue(this.getBlockFromWorker(blockNumber));
-
-                        if (!this.processingQueue) {
-                            this.processQueue();
-                        }
-                    } catch (error) {
-                        observer.error(
-                            BlockProducerError.createUnknown(error)
-                        );
-                    }
-                })
-                .on("error", (error) => {
-                    observer.error(
-                        BlockProducerError.createUnknown(error)
-                    );
-                });
-        } catch (error) {
-            throw BlockProducerError.createUnknown(error);
-        }
-    }
-
-    /**
-     * Unsubscribes from block subscription and resolves on success
-     * 
-     * @returns {Promise<boolean>} - Resolves true on graceful unsubscription.
-     * 
-     * @throws {BlockProducerError} - Throws block producer error on failure to unsubscribe gracefully.
-     */
-    public unsubscribe(): Promise<boolean> {
-        return new Promise((resolve, reject) => {
-            this.activeBackFillingId = null;
-            this.clear();
-            clearTimeout(this.checkIfLiveTimeout);
-
-            if (!this.subscription) {
-                resolve(true);
-
-                return;
-            }
-
-            (this.subscription as Subscription<Log>).unsubscribe((error: Error, success: boolean) => {
-                if (success) {
-                    this.subscription = null;
-                    resolve(true);
-
-                    return;
-                }
-
-                reject(BlockProducerError.createUnknown(error));
+      this.subscription = this.eth
+        .subscribe("newBlockHeaders")
+        .on("data", (blockHeader: BlockHeader) => {
+          try {
+            Logger.debug({
+              location: "eth_subscribe",
+              blockHash: blockHeader.hash,
+              blockNumber: blockHeader.number,
             });
+
+            if (this.lastBlockHash === blockHeader.hash) {
+              return;
+            }
+
+            const blockNumber = blockHeader.number;
+
+            //Adding below logic to get empty blocks details which have not been added to queue.
+            if (this.hasMissedBlocks(blockNumber)) {
+              this.enqueueMissedBlocks(blockNumber);
+            }
+
+            this.lastBlockHash = blockHeader.hash;
+            this.lastReceivedBlockNumber = blockNumber;
+
+            this.enqueue(this.getBlockFromWorker(blockNumber));
+
+            if (!this.processingQueue) {
+              this.processQueue();
+            }
+          } catch (error) {
+            observer.error(BlockProducerError.createUnknown(error));
+          }
+        })
+        .on("error", (error) => {
+          observer.error(BlockProducerError.createUnknown(error));
         });
+    } catch (error) {
+      throw BlockProducerError.createUnknown(error);
     }
+  }
 
-    /**
-     * Private method to emit blocks upto current finalized block.
-     * 
-     * @returns {Promise<void>}
-     */
-    protected abstract backFillBlocks(): Promise<void>;
+  /**
+   * Unsubscribes from block subscription and resolves on success
+   *
+   * @returns {Promise<boolean>} - Resolves true on graceful unsubscription.
+   *
+   * @throws {BlockProducerError} - Throws block producer error on failure to unsubscribe gracefully.
+   */
+  public unsubscribe(): Promise<boolean> {
+    return new Promise((resolve, reject) => {
+      this.activeBackFillingId = null;
+      this.clear();
+      clearTimeout(this.checkIfLiveTimeout);
 
-    /**
-     * Does get the block from the defined worker (workerId).
-     * 
-     * @param {number} blockNumber 
-     * @param {number} workerId
-     * 
-     * @returns {Promise<IBlockGetterWorkerPromise>}
-     */
-    protected abstract getBlockFromWorker(blockNumber: number, workerId?: number): Promise<IBlockGetterWorkerPromise>;
+      if (!this.subscription) {
+        resolve(true);
 
+        return;
+      }
 
-    /**
-     * @async
-     * Private method, process queued promises of getBlock, and calls observer.next when resolved.
-     * 
-     * @returns {Promise<void>}
-     */
-    private async processQueue(): Promise<void> {
-        this.processingQueue = true;
+      (this.subscription as Subscription<Log>).unsubscribe(
+        (error: Error, success: boolean) => {
+          if (success) {
+            this.subscription = null;
+            resolve(true);
 
-        while (!this.isEmpty() && !this.fatalError && this.observer) {
-            try {
-                const promiseResult = await (this.shift()) as IBlockGetterWorkerPromise;
+            return;
+          }
 
-                if (promiseResult?.error) {
-                    throw promiseResult.error;
-                }
+          reject(BlockProducerError.createUnknown(error));
+        }
+      );
+    });
+  }
 
-                const blockNumber = Long.fromValue(promiseResult.block.number);
+  /**
+   * Private method to emit blocks upto current finalized block.
+   *
+   * @returns {Promise<void>}
+   */
+  protected abstract backFillBlocks(): Promise<void>;
 
-                this.nextBlock = parseInt(blockNumber.toString()) + 1;
+  /**
+   * Does get the block from the defined worker (workerId).
+   *
+   * @param {number} blockNumber
+   * @param {number} workerId
+   *
+   * @returns {Promise<IBlockGetterWorkerPromise>}
+   */
+  protected abstract getBlockFromWorker(
+    blockNumber: number,
+    workerId?: number
+  ): Promise<IBlockGetterWorkerPromise>;
 
-                //If the block number is greater than last emitted block, check if there was a re org not detected. 
-                if (
-                    this.isReOrgedMissed(promiseResult.block)
-                ) {
-                    throw new BlockProducerError(
-                        "Chain reorg encountered",
-                        BlockProducerError.codes.REORG_ENCOUNTERED,
-                        true,
-                        "Chain re org not handled",
-                        "block_subscription");
-                }
+  /**
+   * @async
+   * Private method, process queued promises of getBlock, and calls observer.next when resolved.
+   *
+   * @returns {Promise<void>}
+   */
+  private async processQueue(): Promise<void> {
+    this.processingQueue = true;
 
-                this.observer.next(
-                    promiseResult.block
-                );
+    while (!this.isEmpty() && !this.fatalError && this.observer) {
+      try {
+        const promiseResult = (await this.shift()) as IBlockGetterWorkerPromise;
 
-                this.lastEmittedBlock = {
-                    number: blockNumber.toNumber(),
-                    hash: promiseResult.block.hash
-                };
-            } catch (error) {
-                if (error instanceof BlockProducerError) {
-                    this.observer.error(error);
-                }
-                this.fatalError = true;
-                this.observer.error(
-                    BlockProducerError.createUnknown(error)
-                );
-
-                break;
-            }
+        if (promiseResult?.error) {
+          throw promiseResult.error;
         }
 
-        this.processingQueue = false;
-    }
+        const blockNumber = Long.fromValue(promiseResult.block.number);
 
-    /**
-     * @private
-     * 
-     * Method to check if there are empty or missed blocks between last produced block and current event received.
-     * 
-     * @param {number} blockNumber - The block number of the received event log.
-     * 
-     * @returns {boolean}
-     */
-    private hasMissedBlocks(blockNumber: number): boolean {
-        return blockNumber - this.lastReceivedBlockNumber > 1;
-    }
+        this.nextBlock = parseInt(blockNumber.toString()) + 1;
 
-    /**
-     * @private
-     * 
-     * Private method to check if a re org has been missed by the subscription. 
-     * 
-     * @param {IBlock} block - Latest block being emitted.
-     * 
-     * @returns {boolean}
-     */
-    private isReOrgedMissed(block: IBlock): boolean {
-        const blockNumber = Long.fromValue(block.number);
-        return this.lastEmittedBlock &&
-            blockNumber.toNumber() > this.lastEmittedBlock.number &&
-            this.lastEmittedBlock.hash !== block.parentHash ?
-            true :
-            false;
-    }
-
-    /**
-     * @private
-     * 
-     * Method to enqueue missed or empty blocks between last produced blocks and currently received event.
-     * 
-     * @param {number} currentBlockNumber - Block number for which current event was received.
-     * 
-     * @returns {void}
-     */
-    private enqueueMissedBlocks(currentBlockNumber: number): void {
-        for (let i = 1; i < currentBlockNumber - this.lastReceivedBlockNumber; i++) {
-            this.enqueue(this.getBlockFromWorker(this.lastReceivedBlockNumber + i));
+        //If the block number is greater than last emitted block, check if there was a re org not detected.
+        if (this.isReOrgedMissed(promiseResult.block)) {
+          throw new BlockProducerError(
+            "Chain reorg encountered",
+            BlockProducerError.codes.REORG_ENCOUNTERED,
+            true,
+            "Chain re org not handled",
+            "block_subscription"
+          );
         }
+
+        this.observer.next(promiseResult.block);
+
+        this.lastEmittedBlock = {
+          number: blockNumber.toNumber(),
+          hash: promiseResult.block.hash,
+        };
+      } catch (error) {
+        if (error instanceof BlockProducerError) {
+          this.observer.error(error);
+        }
+        this.fatalError = true;
+        this.observer.error(BlockProducerError.createUnknown(error));
+
+        break;
+      }
     }
 
-    private checkIfLive(lastBlockHash: string): void {
-        this.checkIfLiveTimeout = setTimeout(async () => {
-            //Check if the block hash has changed since the timeout. 
-            if (this.lastBlockHash === lastBlockHash) {
-                try {
-                    await this.unsubscribe();
+    this.processingQueue = false;
+  }
 
-                    await this.subscribe(this.observer, this.nextBlock);
-                } catch (error) {
-                    this.observer.error(
-                        BlockProducerError.createUnknown(
-                            `Error when restarting producer: ${error}`
-                        )
-                    );
-                }
+  /**
+   * @private
+   *
+   * Method to check if there are empty or missed blocks between last produced block and current event received.
+   *
+   * @param {number} blockNumber - The block number of the received event log.
+   *
+   * @returns {boolean}
+   */
+  private hasMissedBlocks(blockNumber: number): boolean {
+    return blockNumber - this.lastReceivedBlockNumber > 1;
+  }
 
-                return;
-            }
+  /**
+   * @private
+   *
+   * Private method to check if a re org has been missed by the subscription.
+   *
+   * @param {IBlock} block - Latest block being emitted.
+   *
+   * @returns {boolean}
+   */
+  private isReOrgedMissed(block: IBlock): boolean {
+    const blockNumber = Long.fromValue(block.number);
+    return this.lastEmittedBlock &&
+      blockNumber.toNumber() > this.lastEmittedBlock.number &&
+      this.lastEmittedBlock.hash !== block.parentHash
+      ? true
+      : false;
+  }
 
-            this.checkIfLive(this.lastBlockHash);
-        },
-            this.timeout
-        );
+  /**
+   * @private
+   *
+   * Method to enqueue missed or empty blocks between last produced blocks and currently received event.
+   *
+   * @param {number} currentBlockNumber - Block number for which current event was received.
+   *
+   * @returns {void}
+   */
+  private enqueueMissedBlocks(currentBlockNumber: number): void {
+    for (
+      let i = 1;
+      i < currentBlockNumber - this.lastReceivedBlockNumber;
+      i++
+    ) {
+      this.enqueue(this.getBlockFromWorker(this.lastReceivedBlockNumber + i));
     }
+  }
+
+  private checkIfLive(lastBlockHash: string): void {
+    this.checkIfLiveTimeout = setTimeout(async () => {
+      //Check if the block hash has changed since the timeout.
+      if (this.lastBlockHash === lastBlockHash) {
+        try {
+          await this.unsubscribe();
+
+          await this.subscribe(this.observer, this.nextBlock);
+        } catch (error) {
+          this.observer.error(
+            BlockProducerError.createUnknown(
+              `Error when restarting producer: ${error}`
+            )
+          );
+        }
+
+        return;
+      }
+
+      this.checkIfLive(this.lastBlockHash);
+    }, this.timeout);
+  }
 }
