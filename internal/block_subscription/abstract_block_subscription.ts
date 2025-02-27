@@ -7,7 +7,7 @@ import { IBlock } from "../interfaces/block.js";
 import { Logger } from "../logger/logger.js";
 import { Queue } from "../queue/queue.js";
 import { Eth } from "web3-eth";
-import { BlockHeader } from "web3-eth";
+import { Log } from "web3-core";
 import Long from "long";
 
 /**
@@ -23,7 +23,7 @@ export abstract class AbstractBlockSubscription
   extends Queue<IBlockGetterWorkerPromise>
   implements IBlockSubscription<IBlock, BlockProducerError>
 {
-  private subscription: Subscription<BlockHeader> | null = null;
+  private subscription: Subscription<Log> | null = null;
   // @ts-ignore
   protected observer: IObserver<IBlock, BlockProducerError>; // ts-ignore added for this special case (it will always get initialized in the subscribe method).
   private lastBlockHash: string = "";
@@ -38,24 +38,19 @@ export abstract class AbstractBlockSubscription
     number: number;
     hash: string;
   };
-  private lastReconnectTime: number = 0;
-  private chainId: number = 0;
 
   /**
    * @constructor
    *
    * @param {Eth} eth - Eth module from web3.js
    * @param {number} timeout - Timeout for which if there has been no event, connection must be restarted.
-   * @param {number} reconnectCooldown - Cooldown period between forced reconnections.
    */
   constructor(
     private eth: Eth,
     private timeout: number = 60000,
-    private blockDelay: number = 0,
-    private reconnectCooldown: number = 300000 // 5 minutes cooldown between forced reconnections
+    private blockDelay: number = 0
   ) {
     super();
-    this.lastReceivedBlockNumber = 0; // Ensure it starts at 0 to be properly initialized
   }
 
   /**
@@ -73,14 +68,6 @@ export abstract class AbstractBlockSubscription
     observer: IObserver<IBlock, BlockProducerError>,
     startBlock: number
   ): Promise<void> {
-    if (this.subscription) {
-      Logger.warn({
-        location: "eth_subscribe",
-        message: "Already subscribed, skipping",
-      });
-      return;
-    }
-
     try {
       this.lastFinalizedBlock =
         this.blockDelay > 0
@@ -92,28 +79,9 @@ export abstract class AbstractBlockSubscription
       this.fatalError = false;
       this.nextBlock = startBlock;
       this.lastBlockHash = "";
-
-      // Validate chain ID to ensure we're on the correct network
-      const chainId = await this.eth.getChainId();
-      this.chainId = chainId;
-      Logger.info({
-        location: "eth_subscribe",
-        message: "Connected to chain",
-        chainId,
-      });
-
-      // Initialize lastReceivedBlockNumber to startBlock - 1
-      // Always reset to ensure we don't have an invalid value from a previous run
       this.lastReceivedBlockNumber = startBlock - 1;
-      Logger.info({
-        location: "eth_subscribe_init",
-        message: "Initializing lastReceivedBlockNumber",
-        value: this.lastReceivedBlockNumber,
-      });
 
-      // Skip the check for potentially invalid lastReceivedBlockNumber since we're always resetting it now
-
-      // Backfill historical blocks
+      // Number 50 is added to allow block producer to create log subscription even and catch up after backfilling.
       if (this.lastFinalizedBlock - 50 > startBlock) {
         this.backFillBlocks();
 
@@ -122,54 +90,31 @@ export abstract class AbstractBlockSubscription
 
       this.checkIfLive(this.lastBlockHash);
 
-      // Use newBlockHeaders to get only one notification per block
       this.subscription = this.eth
-        .subscribe("newBlockHeaders")
-        .on("data", (blockHeader: BlockHeader) => {
+        .subscribe("logs", { fromBlock: this.nextBlock })
+        .on("data", (log: Log) => {
           try {
-            // Convert block number to number type if it's a string
-            const blockNumber =
-              typeof blockHeader.number === "string"
-                ? parseInt(blockHeader.number)
-                : blockHeader.number;
-            const blockHash = blockHeader.hash;
+            Logger.debug({
+              location: "eth_subscribe",
+              blockHash: log.blockHash,
+              blockNumber: log.blockNumber,
+              logIndex: log.logIndex,
+            });
 
-            // Skip if we've already seen this block hash or if block number is not newer
-            if (
-              blockHash === this.lastBlockHash ||
-              blockNumber <= this.lastReceivedBlockNumber
-            ) {
-              Logger.debug({
-                location: "eth_subscribe_skip",
-                reason:
-                  blockHash === this.lastBlockHash
-                    ? "duplicate_hash"
-                    : "old_block",
-                blockHash,
-                blockNumber,
-                lastBlockHash: this.lastBlockHash,
-                lastBlockNumber: this.lastReceivedBlockNumber,
-              });
+            if (this.lastBlockHash == log.blockHash) {
               return;
             }
 
-            // Only log once per block for debugging
-            Logger.debug({
-              location: "eth_subscribe",
-              blockHash,
-              blockNumber,
-            });
-
-            // Check for missed blocks before updating state
-            if (this.hasMissedBlocks(blockNumber)) {
-              this.enqueueMissedBlocks(blockNumber);
+            //Adding below logic to get empty blocks details which have not been added to queue.
+            if (this.hasMissedBlocks(log.blockNumber)) {
+              this.enqueueMissedBlocks(log.blockNumber);
             }
 
-            // Update state only after we're sure we want to process this block
-            this.lastBlockHash = blockHash;
-            this.lastReceivedBlockNumber = blockNumber;
+            this.lastBlockHash = log.blockHash;
+            this.lastReceivedBlockNumber = log.blockNumber;
 
-            this.enqueue(this.getBlockFromWorker(blockNumber, undefined));
+            this.enqueue(this.getBlockFromWorker(log.blockNumber));
+
             if (!this.processingQueue) {
               this.processQueue();
             }
@@ -200,26 +145,22 @@ export abstract class AbstractBlockSubscription
 
       if (!this.subscription) {
         resolve(true);
+
         return;
       }
 
-      // If we're using polling, there's no subscription to unsubscribe from
-      if (this.subscription) {
-        (this.subscription as Subscription<BlockHeader>).unsubscribe(
-          (error: Error, success: boolean) => {
-            if (success) {
-              this.subscription = null;
-              resolve(true);
+      (this.subscription as Subscription<Log>).unsubscribe(
+        (error: Error, success: boolean) => {
+          if (success) {
+            this.subscription = null;
+            resolve(true);
 
-              return;
-            }
-
-            reject(BlockProducerError.createUnknown(error));
+            return;
           }
-        );
-      } else {
-        resolve(true);
-      }
+
+          reject(BlockProducerError.createUnknown(error));
+        }
+      );
     });
   }
 
@@ -341,129 +282,18 @@ export abstract class AbstractBlockSubscription
       i < currentBlockNumber - this.lastReceivedBlockNumber;
       i++
     ) {
-      this.enqueue(
-        this.getBlockFromWorker(this.lastReceivedBlockNumber + i, undefined)
-      );
+      this.enqueue(this.getBlockFromWorker(this.lastReceivedBlockNumber + i));
     }
   }
 
   private checkIfLive(lastBlockHash: string): void {
     this.checkIfLiveTimeout = setTimeout(async () => {
-      // Check if the block hash has changed since the timeout.
+      //Check if the block hash has changed since the timeout.
       if (this.lastBlockHash === lastBlockHash) {
         try {
-          Logger.debug({
-            location: "eth_subscribe_reconnect",
-            message:
-              "No new blocks received in timeout period, checking connection",
-            lastBlockHash,
-            timeout: this.timeout,
-          });
+          await this.unsubscribe();
 
-          // Instead of immediately unsubscribing and resubscribing,
-          // first check if we can get the latest block to verify the connection
-          try {
-            const latestBlock = await this.eth.getBlock("latest");
-
-            // Log detailed information about the latest block
-            Logger.debug({
-              location: "eth_subscribe_latest_block",
-              blockHash: latestBlock?.hash,
-              blockNumber: latestBlock?.number,
-              lastReceivedBlockNumber: this.lastReceivedBlockNumber,
-            });
-
-            if (latestBlock && latestBlock.hash !== this.lastBlockHash) {
-              // Connection is working but subscription isn't delivering blocks
-              // Process this block manually and reset the timeout
-              Logger.debug({
-                location: "eth_subscribe_manual_block",
-                message:
-                  "Connection is working but subscription isn't delivering blocks",
-                blockHash: latestBlock.hash,
-                blockNumber: latestBlock.number,
-              });
-
-              const blockNumber =
-                typeof latestBlock.number === "string"
-                  ? parseInt(latestBlock.number)
-                  : latestBlock.number;
-
-              // Only process if it's a new block
-              if (blockNumber > this.lastReceivedBlockNumber) {
-                this.lastBlockHash = latestBlock.hash;
-                this.lastReceivedBlockNumber = blockNumber;
-
-                if (this.hasMissedBlocks(blockNumber)) {
-                  this.enqueueMissedBlocks(blockNumber);
-                }
-
-                this.enqueue(this.getBlockFromWorker(blockNumber, undefined));
-                if (!this.processingQueue) {
-                  this.processQueue();
-                }
-
-                // Reset the check with the new hash
-                this.checkIfLive(latestBlock.hash);
-                return;
-              }
-            }
-
-            // If we get here, either:
-            // 1. We couldn't get the latest block (connection issue)
-            // 2. The latest block is the same as our last block (chain isn't progressing)
-            // 3. We already processed the latest block manually
-
-            // Only reconnect if it's been a long time since the last reconnection
-            // This prevents excessive reconnections and eth_subscribe calls
-            if (Date.now() - this.lastReconnectTime > this.reconnectCooldown) {
-              Logger.debug({
-                location: "eth_subscribe_force_reconnect",
-                message:
-                  "Forcing reconnection after extended period without new blocks",
-                timeSinceLastReconnect: Date.now() - this.lastReconnectTime,
-                reconnectCooldown: this.reconnectCooldown,
-              });
-
-              await this.unsubscribe();
-              await this.subscribe(this.observer, this.nextBlock);
-              this.lastReconnectTime = Date.now();
-            } else {
-              // Just check again later without reconnecting
-              Logger.debug({
-                location: "eth_subscribe_skip_reconnect",
-                message: "Skipping reconnection due to cooldown period",
-                timeSinceLastReconnect: Date.now() - this.lastReconnectTime,
-                reconnectCooldown: this.reconnectCooldown,
-              });
-              this.checkIfLive(this.lastBlockHash);
-            }
-          } catch (error) {
-            // If we can't even get the latest block, there's likely a connection issue
-            // But still respect the reconnection cooldown
-            if (Date.now() - this.lastReconnectTime > this.reconnectCooldown) {
-              Logger.debug({
-                location: "eth_subscribe_connection_error",
-                message: "Error getting latest block, reconnecting",
-                error: String(error),
-              });
-
-              await this.unsubscribe();
-              await this.subscribe(this.observer, this.nextBlock);
-              this.lastReconnectTime = Date.now();
-            } else {
-              // Just check again later without reconnecting
-              Logger.debug({
-                location: "eth_subscribe_skip_reconnect_error",
-                message:
-                  "Error getting latest block, but skipping reconnection due to cooldown period",
-                error: String(error),
-                timeSinceLastReconnect: Date.now() - this.lastReconnectTime,
-                reconnectCooldown: this.reconnectCooldown,
-              });
-              this.checkIfLive(this.lastBlockHash);
-            }
-          }
+          await this.subscribe(this.observer, this.nextBlock);
         } catch (error) {
           this.observer.error(
             BlockProducerError.createUnknown(
